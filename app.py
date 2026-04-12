@@ -2,16 +2,18 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from deepface import DeepFace
 import base64
-import cv2
 import numpy as np
 import os
 
 app = Flask(__name__)
 CORS(app)
 
-# Directory to save uploaded images
+MODEL_NAME = "ArcFace"
+SIMILARITY_THRESHOLD = 0.32
+
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
 
 def save_base64_image(base64_str, filename):
     img_data = base64.b64decode(base64_str.split(',')[1])
@@ -24,121 +26,102 @@ def save_base64_image(base64_str, filename):
 def cosine_similarity(a, b):
     a = np.array(a)
     b = np.array(b)
-    return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
+    return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
-@app.route("/embedding", methods=["POST"])
-def get_embedding():
+
+@app.route('/getfaceembedding', methods=['POST'])
+def get_face_embedding():
     """
     Accepts JSON:
     {
         "image": "data:image/jpeg;base64,..."
     }
-    Returns 128-d face embedding
+    Returns the face embedding for a single-face image.
     """
-    data = request.json
-    if "image" not in data:
-        return jsonify({"error": "No image provided"}), 400
-    
-    img_b64 = data["image"]
-    img_path = save_base64_image(img_b64, "temp.jpg")
-    
-    try:
-        embedding = DeepFace.represent(img_path, enforce_detection=True)[0]["embedding"]
-        return jsonify({"embedding": embedding})
-    except Exception as e:
-        print("Error:", str(e))
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route('/faceembedding', methods=['POST'])
-def get_face_embedding():
     try:
         data = request.json
-        image_base64 = data.get("image")
-
-        if not image_base64:
+        if not data or not data.get("image"):
             return jsonify({"error": "No image provided"}), 400
 
-        img_b64 = data["image"]
-        img_path = save_base64_image(img_b64, "temp.jpg")
-        
-        # 🔍 Detect faces
-        faces = DeepFace.extract_faces(img_path=img_path, enforce_detection=False)
-        face_count = len(faces)
-        print("Error1:")
+        img_path = save_base64_image(data["image"], "temp.jpg")
 
-        # 🧠 Get embeddings for all faces
-        representations = DeepFace.represent(img_path=img_path, enforce_detection=False)
+        representations = DeepFace.represent(
+            img_path=img_path,
+            model_name=MODEL_NAME,
+            enforce_detection=True,
+            detector_backend='mtcnn'
+        )
 
-        embeddings = [rep["embedding"] for rep in representations]
+        if len(representations) == 0:
+            return jsonify({"error": "No face detected"}), 400
+
+        if len(representations) > 1:
+            return jsonify({"error": "Multiple faces detected, expected single face"}), 400
 
         return jsonify({
-            "face_count": face_count,
-            "embeddings": embeddings
+            "embedding": representations[0]["embedding"]
         })
 
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/verify", methods=["POST"])
-def verify_faces():
+
+@app.route('/facematch', methods=['POST'])
+def face_match():
     """
     Accepts JSON:
     {
-        "image1": "data:image/jpeg;base64,...",
-        "image2": "data:image/jpeg;base64,..."
+        "image": "data:image/jpeg;base64,...",
+        "users": [
+            {"id": "u1", "name": "John", "embedding": [0.12, -0.34, ...]},
+            {"id": "u2", "name": "Alice", "embedding": [0.56, 0.78, ...]}
+        ]
     }
-    Returns verification result
+    Detects all faces in the image and matches each face to the closest
+    registered user. Returns the name for each detected face.
     """
-    data = request.json
-    if "image1" not in data or "image2" not in data:
-        return jsonify({"error": "Both images required"}), 400
-    
-    img1_path = save_base64_image(data["image1"], "img1.jpg")
-    img2_path = save_base64_image(data["image2"], "img2.jpg")
-    
-    try:
-        result = DeepFace.verify(img1_path, img2_path)
-        return jsonify(result)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/match', methods=['POST'])
-def match_faces():
     try:
         data = request.json
-        image_base64 = data.get("image")
-        patient_embeddings = data.get("patients")  # list of {id, embedding}
+        if not data or not data.get("image") or not data.get("users"):
+            return jsonify({"error": "Missing image or users list"}), 400
 
-        if not image_base64 or not patient_embeddings:
-            return jsonify({"error": "Missing image or patient embeddings"}), 400
+        img_path = save_base64_image(data["image"], "temp.jpg")
 
-        img_b64 = data["image"]
-        img_path = save_base64_image(img_b64, "temp.jpg")
+        representations = DeepFace.represent(
+            img_path=img_path,
+            model_name=MODEL_NAME,
+            enforce_detection=True,
+            detector_backend='mtcnn'
+        )
 
-        # 🧠 Get embeddings for faces in image
-        representations = DeepFace.represent(img_path=img_path, enforce_detection=False)
+        if len(representations) == 0:
+            return jsonify({"error": "No faces detected"}), 400
 
+        threshold = SIMILARITY_THRESHOLD
+        users = data["users"]
         results = []
 
         for i, face in enumerate(representations):
             face_embedding = face["embedding"]
 
-            best_match = None
+            best_id = None
+            best_name = None
             best_score = -1
 
-            for patient in patient_embeddings:
-                score = cosine_similarity(face_embedding, patient["embedding"])
-
+            for user in users:
+                score = cosine_similarity(face_embedding, user["embedding"])
                 if score > best_score:
                     best_score = score
-                    best_match = patient["id"]
+                    best_id = user["id"]
+                    best_name = user["name"]
 
-            results.append({
-                "face_index": i,
-                "matched_patient_id": best_match if best_score > 0.7 else None,
-                "similarity": float(best_score)
-            })
+            if best_score > threshold:
+                results.append({
+                    "face_index": i,
+                    "name": best_name,
+                    "user_id": best_id,
+                    "similarity": best_score
+                })
 
         return jsonify({
             "face_count": len(representations),
@@ -148,5 +131,6 @@ def match_faces():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000, debug=True)
+    app.run(host="0.0.0.0", port=5001, debug=True)
