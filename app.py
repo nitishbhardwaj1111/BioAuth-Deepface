@@ -65,7 +65,7 @@ def cosine_similarity(a, b):
     return float(np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b)))
 
 
-@app.route('/getfaceembedding', methods=['POST'])
+@app.route('/api/getfaceembedding', methods=['POST'])
 def get_face_embedding():
     """
     Accepts JSON:
@@ -102,7 +102,7 @@ def get_face_embedding():
         return jsonify({"error": str(e)}), 500
 
 
-@app.route('/facematch', methods=['POST'])
+@app.route('/api/facematch', methods=['POST'])
 def face_match():
     """
     Accepts JSON:
