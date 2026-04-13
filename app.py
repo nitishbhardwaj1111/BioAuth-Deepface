@@ -4,6 +4,11 @@ from deepface import DeepFace
 import base64
 import numpy as np
 import os
+import json
+import mysql.connector
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = Flask(__name__)
 CORS(app)
@@ -13,6 +18,37 @@ SIMILARITY_THRESHOLD = 0.32
 
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
+
+def get_db_connection():
+    return mysql.connector.connect(
+        host=os.getenv("DB_HOST"),
+        port=int(os.getenv("DB_PORT", 3306)),
+        user=os.getenv("DB_USER"),
+        password=os.getenv("DB_PASSWORD"),
+        database=os.getenv("DB_NAME"),
+    )
+
+
+def get_patients_with_embeddings():
+    conn = get_db_connection()
+    cursor = conn.cursor(dictionary=True)
+    cursor.execute(
+        "SELECT p.uuid, p.uhid, pfe.embedding FROM dev_hmis_patients_18_12_2019.patient_face_embedding pfe JOIN patients p ON pfe.patient_uuid = p.uuid where pfe.is_active = 1"
+    )
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+
+    patients = []
+    for row in rows:
+        embedding = row["embedding"]
+        while isinstance(embedding, (str, bytes)):
+            embedding = json.loads(embedding)
+        patients.append({
+            "uuid": row["uuid"],
+            "embedding": embedding,
+        })
+    return patients
 
 
 def save_base64_image(base64_str, filename):
@@ -71,19 +107,15 @@ def face_match():
     """
     Accepts JSON:
     {
-        "image": "data:image/jpeg;base64,...",
-        "users": [
-            {"id": "u1", "name": "John", "embedding": [0.12, -0.34, ...]},
-            {"id": "u2", "name": "Alice", "embedding": [0.56, 0.78, ...]}
-        ]
+        "image": "data:image/jpeg;base64,..."
     }
     Detects all faces in the image and matches each face to the closest
-    registered user. Returns the name for each detected face.
+    patient from the database. Returns the name for each detected face.
     """
     try:
         data = request.json
-        if not data or not data.get("image") or not data.get("users"):
-            return jsonify({"error": "Missing image or users list"}), 400
+        if not data or not data.get("image"):
+            return jsonify({"error": "Missing image"}), 400
 
         img_path = save_base64_image(data["image"], "temp.jpg")
 
@@ -97,29 +129,29 @@ def face_match():
         if len(representations) == 0:
             return jsonify({"error": "No faces detected"}), 400
 
+        patients = get_patients_with_embeddings()
+        if not patients:
+            return jsonify({"error": "No patients with embeddings found in database"}), 404
+
         threshold = SIMILARITY_THRESHOLD
-        users = data["users"]
         results = []
 
         for i, face in enumerate(representations):
             face_embedding = face["embedding"]
 
-            best_id = None
-            best_name = None
+            best_uuid = None
             best_score = -1
 
-            for user in users:
-                score = cosine_similarity(face_embedding, user["embedding"])
+            for patient in patients:
+                score = cosine_similarity(face_embedding, patient["embedding"])
                 if score > best_score:
                     best_score = score
-                    best_id = user["id"]
-                    best_name = user["name"]
+                    best_uuid = patient["uuid"]
 
             if best_score > threshold:
                 results.append({
                     "face_index": i,
-                    "name": best_name,
-                    "user_id": best_id,
+                    "patient_uuid": best_uuid,
                     "similarity": best_score
                 })
 
